@@ -58,8 +58,8 @@ class MongoContents(ContentsManager):
     # regex to match valid file/directory names
     _name_regex = r'^[^\\/?%*:|"<>\.]+$'
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
         self._client: MongoClient = MongoClient(self.mongodb_uri)
         self._database: MongoDatabase = self._client[self.database_name]
         self._directories: MongoCollection\
@@ -245,6 +245,7 @@ class MongoContents(ContentsManager):
             model = self._get_notebook(path, content)
         else:
             model = None
+        self.log.debug(f"got model at path {path}: {repr(model)}")
         return model
 
     def _get_directory(self, path, content=True) -> Union[dict, None]:
@@ -259,20 +260,29 @@ class MongoContents(ContentsManager):
             'name': os.path.basename(data['path']),
             'path': self.denormalize_path(data['path']),
             'mimetype': None,
-            'type': 'directory'
+            'type': 'directory',
+            'writable': True,
+            'created': data['created'],
+            'last_modified': data['last_modified'],
+            'content': None,
+            'format': None,
         }
         if not content:
             return model
 
         # get content
+        # this is fun! :)
+        # directories are easier than files
+
+        # children: list of content-less models
+        children: List[dict] = []
+        # match_regex: regex to match exactly one level past the path
+        match_regex = '^' + re.escape(path.rstrip('/') + '/') + r'[^\/]+$'
+
         subdirectories = self._directories.find(
-            {'path': {'$regex': '^' + re.escape(path.rstrip('/') + '/')
-                                + r'[^\/]+$'}})
-        files: List[GridOut] = self._files.find(
-            {'filename': {'$regex': r'^' + re.escape(path.rstrip('/') + '/')
-                                    + r'[^\/]+$'}})
-        children = []
+            {'path': {'$regex': match_regex}})
         for subdirectory in subdirectories:
+            print(subdirectory['path'])
             children.append({
                 'name': os.path.basename(subdirectory['path']),
                 'path': self.denormalize_path(subdirectory['path']),
@@ -280,21 +290,46 @@ class MongoContents(ContentsManager):
                 'created': subdirectory['created'],
                 'last_modified': subdirectory['last_modified'],
                 'mimetype': None,
-                'format': 'json'
+                'format': 'json',
+                'content': None,
             })
-        for file in files:
-            if ('deleted' in file.metadata
-                    and file.metadata['deleted'] is True):
+
+        # description of pipeline:
+        # $match: is pretty obvious
+        # $sort: sorts individual files by their uploadedDate (newest first)
+        # $group: groups documents together
+        #   - _id: $filename groups by filename
+        #   - item is the directory or file in the returned document ($first:
+        #     specifies that we want the first matching document (i.e. newest)
+        #     and $$ROOT means that we want the entire document
+        # $project: we only care about the file we found in the grouping stage
+        pipeline = [
+            {'$match': {'filename': {'$regex': match_regex}}},
+            {'$sort': {'uploadedDate': -1}},
+            {'$group': {'_id': '$filename', 'file': {'$first': '$$ROOT'}}},
+            {'$project': {'file': 1, '_id': 0}},
+        ]
+        files_cursor = self._files_metadata.aggregate(pipeline)
+        for document in files_cursor:
+            # note: since file is a document, not a GridOut, we can't use
+            # .attribute, we have to use ['attribute']
+            file = document['file']
+            metadata = file['metadata']
+            print(file['filename'])
+            if ('deleted' in metadata
+                    and metadata['deleted'] is True):
                 continue
             children.append({
-                'name': os.path.basename(file.filename),
-                'path': self.denormalize_path(file.filename),
-                'type': file.metadata['type'],
-                'created': file.metadata['created'],
-                'last_modified': file.metadata['last_modified'],
-                'mimetype': file.metadata['mimetype'],
-                'format': file.metadata['format']
+                'name': os.path.basename(file['filename']),
+                'path': self.denormalize_path(file['filename']),
+                'type': metadata['type'],
+                'created': metadata['created'],
+                'last_modified': metadata['last_modified'],
+                'mimetype': metadata['mimetype'],
+                'format': metadata['format'],
+                'content': None,
             })
+        children.sort(key=lambda i: i['name'])
         model['content'] = children
         model['format'] = 'json'
         return model
@@ -314,7 +349,11 @@ class MongoContents(ContentsManager):
             'path': self.denormalize_path(metadata['path']),
             'format': metadata['format'],
             'mimetype': metadata['mimetype'],
-            'type': metadata['type']
+            'type': metadata['type'],
+            'created': metadata['created'],
+            'last_modified': metadata['last_modified'],
+            'writable': True,
+            'content': None,
         }
         if not content:
             return model
@@ -334,14 +373,23 @@ class MongoContents(ContentsManager):
         model = {
             'name': metadata['name'],
             'path': self.denormalize_path(metadata['path']),
-            'format': metadata['format'],
+            'format': None,
+            'content': None,
             'mimetype': metadata['mimetype'],
-            'type': metadata['type']
+            'type': metadata['type'],
+            'created': metadata['created'],
+            'last_modified': metadata['last_modified'],
+            'writable': True,
         }
         if not content:
+            self.log.debug(
+                f"Returning model at {path} without content: {model}")
             return model
 
+        model['format'] = 'json'
         model['content'] = nbformat.notebooknode.from_dict(json.load(file))
+        self.log.debug(
+            f"Returning model at {path} with content: {model}")
         return model
 
     def delete_file(self, path):
@@ -374,17 +422,26 @@ class MongoContents(ContentsManager):
 
         self.run_pre_save_hook(model, path)
 
-        path = path.rstrip('/')
-        if not path.startswith('/'):
-            path = os.path.join(self.path_prefix, path)
+        model['path'] = path.strip('/')
+        model['name'] = os.path.basename(model['path'])
+        model['created'] = (model['created'] if 'created' in model
+                            else datetime.datetime.now())
+        model['last_modified'] = datetime.datetime.now()
+        model['mimetype'] = (model['mimetype'] if 'mimetype' in model
+                             else None)
+        model['writable'] = True
+
+        normal_path = self.normalize_path(path)
         if model['type'] == 'directory':
-            self._save_directory(model, path)
+            self._save_directory(model, normal_path)
         elif model['type'] == 'file':
-            self._save_file(model, path)
+            self._save_file(model, normal_path)
         elif model['type'] == 'notebook':
-            self._save_notebook(model, path)
+            self._save_notebook(model, normal_path)
         else:
             raise web.HTTPError(400, "Not implemented.")
+
+        return self.get(path, content=False)
 
     def _save_directory(self, model, path):
         try:
@@ -396,27 +453,36 @@ class MongoContents(ContentsManager):
         except DuplicateKeyError:
             self.log.debug('Tried to create directory {} which already exists'
                            .format(path))
+        return model
 
     def _save_file(self, model, path, file_type='file'):
         file_metadata = {
             'name': os.path.basename(path),
             'path': path,
             'type': file_type,
-            'created': datetime.datetime.now(),  # todo, preserve original time
-            'last_modified': datetime.datetime.now(),
+            'created': model['created'],
+            'last_modified': model['last_modified'],
             'mimetype': model['mimetype'],
-            'format': model['format'],
+            'format': model['format'] if 'format' in model else None,
         }
         file: GridIn = self._files.open_upload_stream(
             filename=path, metadata=file_metadata)
-        file.content_type = model['mimetype']
+        if 'mimetype' is not None:
+            file.content_type = model['mimetype']
         file.write(model["content"].encode())
         file.close()
+        self.log.debug(f"Saved file {path} model {repr(model)}")
+        return {key: model[key] for key in model.keys() if key != 'content'}
 
     def _save_notebook(self, model, path):
+        model['format'] = 'json'
         json_serialization = json.dumps(model['content'])
         # create a quasi-deep copy (so we don't overwrite original content)
         file_model = {key: model[key]
                       for key in model.keys() if key != 'content'}
         file_model['content'] = json_serialization
         self._save_file(file_model, path, file_type='notebook')
+        result = {key: model[key] for key in model.keys()}
+        self.log.debug(f"Saved notebook {path} model {repr(result)}")
+        return {key: model[key] for key in model.keys()
+                if (key != 'content' and key != 'format')}

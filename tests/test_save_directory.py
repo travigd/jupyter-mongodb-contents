@@ -71,3 +71,9 @@ class TestSaveDirectory(TestCase):
     def test_root(self):
         self.reset_db()
         assert self.contents.get('') is not None
+
+    def test_rename(self):
+        self.reset_db()
+        self.contents.save({'type': 'directory'}, 'foo')
+        self.contents.save({'type': 'directory'}, 'bar')
+        self.contents.rename_file('foo', 'spam')
